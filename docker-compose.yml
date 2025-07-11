@@ -2,10 +2,11 @@ version: '3.8'
 
 services:
   runner:
-    image: youssefbrr/github-actions:latest # You can use this image or build your own
+    build:
+      context: ./Docker Image
     restart: always
     environment:
-      - REPO=<owner>/<repo>
+      - REG_URL=<reg-url>
       - REG_TOKEN=<reg-token-for-self-hosted-runner>
       - NAME=<runner-name>
     deploy:
