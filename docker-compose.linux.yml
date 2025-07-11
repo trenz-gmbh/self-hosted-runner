@@ -4,6 +4,8 @@ services:
   runner:
     build:
       context: ./Docker Image
+      dockerfile: Dockerfile.linux
+    platform: linux/x64
     restart: always
     environment:
       - REG_URL=<reg-url>
