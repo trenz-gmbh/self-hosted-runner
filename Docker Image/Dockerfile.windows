@@ -1,16 +1,123 @@
-FROM mcr.microsoft.com/windows/nanoserver:ltsc2019
+# escape=`
 
-ARG RUNNER_VERSION="2.322.0"
+ARG WindowsServerCoreRepo=windows/servercore
+ARG DOTNET_VERSION=9.0
+ARG WINVER=2019
+ARG DotNetSdk="C:\Program Files\dotnet\sdk"
 
-SHELL pwsh.exe
+########### Extract PowerShell Core ###########
+# mostly taken from https://github.com/PowerShell/PowerShell-Docker/blob/db9597dface903f34b4e2843f50fdde1e947ba43/release/7-5/windowsservercore2022/docker/Dockerfile
+FROM mcr.microsoft.com/${WindowsServerCoreRepo}:ltsc${WINVER} as powershell-installer-env
 
-# Set up the actions runner
-RUN mkdir \actions-runner && cd \actions-runner `
-    && Invoke-WebRequest -OutFile actions-runner-win-x64-${RUNNER_VERSION}.zip -L https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-win-x64-${RUNNER_VERSION}.zip `
-    && Add-Type -AssemblyName System.IO.Compression.FileSystem ; [System.IO.Compression.ZipFile]::ExtractToDirectory("$PWD/actions-runner-win-x64-${RUNNER_VERSION}.zip", "$PWD")
+ARG PS_VERSION=7.5.2
+ARG PS_PACKAGE_URL=https://github.com/PowerShell/PowerShell/releases/download/v${PS_VERSION}/PowerShell-${PS_VERSION}-win-x64.zip
 
-# Copy the start script and make it executable
-COPY start.ps1 \start.ps1
+SHELL ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-command"]
 
-# Define the entrypoint
-ENTRYPOINT ["/start.ps1"]
+RUN Write-host "Verifying valid Version..."; `
+    if (!($env:PS_VERSION -match '^\d+\.\d+\.\d+(-\w+(\.\d+)?)?$' )) { `
+        throw ('PS_Version ({0}) must match the regex "^\d+\.\d+\.\d+(-\w+(\.\d+)?)?$"' -f $env:PS_VERSION) `
+    }
+
+RUN Write-Host "Downloading $env:PS_PACKAGE_URL"; `
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; `
+    Invoke-WebRequest -Uri $env:PS_PACKAGE_URL -outfile /powershell.zip; `
+    Expand-Archive powershell.zip -DestinationPath \PowerShell
+
+########### Runner image ###########
+
+FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION}-windowsservercore-ltsc${WINVER}
+
+# build tools have .NET 6; we also need .NET 5 (and .NET Framework 4.x)
+#COPY --from=mcr.microsoft.com/dotnet/sdk:5.0 ${DotNetSdk} ${DotNetSdk}
+
+USER ContainerAdministrator
+
+# Restore the default Windows shell for correct batch processing.
+SHELL ["cmd", "/S", "/C"]
+
+# Copy PowerShell Core from the installer container
+ENV `
+    # set a fixed location for the Module analysis cache
+    PSModuleAnalysisCachePath="C:\Users\Public\AppData\Local\Microsoft\Windows\PowerShell\docker\ModuleAnalysisCache" `
+    # Persist %PSCORE% ENV variable for user convenience
+    PSCORE="C:\Program Files\PowerShell\pwsh.exe" `
+    POWERSHELL_DISTRIBUTION_CHANNEL="PSDocker-WindowsServerCore-ltsc${WINVER}" `
+    POWERSHELL_TELEMETRY_OPTOUT="1"
+
+# Copy PowerShell Core from the installer container
+COPY --from=powershell-installer-env ["\\PowerShell\\", "\\Program Files\\PowerShell\\latest"]
+
+# Set the path
+RUN setx /M PATH "C:\Program Files\PowerShell\latest;%PATH%;"
+
+# intialize powershell module cache
+RUN pwsh `
+        -NoLogo `
+        -NoProfile `
+        -Command " `
+          $stopTime = (get-date).AddMinutes(15); `
+          $ErrorActionPreference = 'Stop' ; `
+          $ProgressPreference = 'SilentlyContinue' ; `
+          while(!(Test-Path -Path $env:PSModuleAnalysisCachePath)) {  `
+            Write-Host "'Waiting for $env:PSModuleAnalysisCachePath'" ; `
+            if((get-date) -gt $stopTime) { throw 'timout expired'} `
+            Start-Sleep -Seconds 6 ; `
+          }"
+
+########### VS Installation ###########
+
+RUN `
+    # Download the Build Tools bootstrapper.
+    curl -SL --output vs_buildtools.exe https://aka.ms/vs/17/release/vs_buildtools.exe `
+    `
+    # Install Build Tools with the Microsoft.VisualStudio.Workload.AzureBuildTools workload, excluding workloads and components with known issues.
+    && (start /w vs_buildtools.exe --quiet --wait --norestart --nocache `
+        --installPath "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools" `
+        --add Microsoft.VisualStudio.Workload.AzureBuildTools `
+        --add Microsoft.VisualStudio.Component.Roslyn.Compiler `
+        --add Microsoft.Component.MSBuild `
+        --add Microsoft.VisualStudio.Component.CoreBuildTools `
+        --add Microsoft.VisualStudio.Workload.MSBuildTools `
+        --add Microsoft.VisualStudio.Component.TestTools.BuildTools `
+        --add Microsoft.Net.Component.4.8.SDK `
+        --add Microsoft.Net.Component.4.7.2.TargetingPack `
+        --add Microsoft.VisualStudio.Component.NuGet.BuildTools `
+        --add Microsoft.VisualStudio.Web.BuildTools.ComponentGroup `
+        --add Microsoft.Net.ComponentGroup.DevelopmentPrerequisites `
+        --add Microsoft.VisualStudio.Component.TypeScript.TSServer `
+        --add Microsoft.Net.Component.4.8.TargetingPack `
+        --add Microsoft.Net.ComponentGroup.4.8.DeveloperTools `
+        --add Microsoft.NetCore.Component.Runtime.6.0 `
+        --add Microsoft.NetCore.Component.Runtime.7.0 `
+        --add Microsoft.NetCore.Component.Runtime.8.0 `
+        --add Microsoft.NetCore.Component.SDK `
+        --add Microsoft.VisualStudio.Component.DockerTools.BuildTools `
+        --add Microsoft.Component.ClickOnce.MSBuild `
+        --add Microsoft.VisualStudio.Wcf.BuildTools.ComponentGroup `
+        --add Microsoft.VisualStudio.Component.WebDeploy `
+        --add Microsoft.VisualStudio.Workload.WebBuildTools `
+        --add Microsoft.VisualStudio.Workload.ManagedDesktopBuildTools `
+        --add Microsoft.VisualStudio.Component.Roslyn.LanguageServices `
+        || IF "%ERRORLEVEL%"=="3010" EXIT 0) `
+    `
+    # Cleanup
+    && del /q vs_buildtools.exe
+
+########### Runner Setup ###########
+
+SHELL ["powershell.exe", "-Command"]
+
+RUN New-Item -ItemType Directory -Path C:\actions-runner
+
+WORKDIR C:\\actions-runner
+
+ARG RUNNER_VERSION=2.326.0
+
+RUN Invoke-WebRequest -Uri "https://github.com/actions/runner/releases/download/v$env:RUNNER_VERSION/actions-runner-win-x64-$env:RUNNER_VERSION.zip" -OutFile "actions-runner-win-x64-$env:RUNNER_VERSION.zip"
+
+RUN Add-Type -AssemblyName System.IO.Compression.FileSystem ; $zip = Join-Path $PWD "actions-runner-win-x64-$env:RUNNER_VERSION.zip" ; [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $PWD) ; Remove-Item $zip
+
+COPY start.ps1 C:\\start.ps1
+
+ENTRYPOINT ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File", "C:\\start.ps1"]
